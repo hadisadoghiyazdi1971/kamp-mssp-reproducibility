@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software or generated benchmark data, please cite the KAMP manuscript."
+title: "KAMP: Reproducibility Package for Covariance-Aware Sparse Recovery"
+type: software
+authors:
+  - family-names: Ghalenoei
+    given-names: Yousof
+    orcid: "https://orcid.org/0009-0002-0526-9407"
+  - family-names: Sadoghi-Yazdi
+    given-names: Hadi
+    orcid: "https://orcid.org/0000-0002-6885-4956"
+repository-code: "https://github.com/hadisadoghiyazdi1971/kamp-mssp-reproducibility"
+version: "1.0.0"
+date-released: 2026-08-27

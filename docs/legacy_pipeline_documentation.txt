@@ -1,0 +1,320 @@
+# KAMP / DKAMP Codebase — Full Technical Documentation
+
+This document explains, in detail, how the two uploaded files work:
+
+- `kamp_complete.py` — the core solver library and the main (33-experiment) benchmark pipeline.
+- `kamp_regime_suite.py` — a second, independent experiment driver (17 experiments across 6 "regimes") that imports the solvers directly from `kamp_complete.py`.
+
+The main focus, as requested, is the proposed method **KAMP** (Kalman Approximate Message Passing) and its distributed extension **DKAMP** (Distributed KAMP). Every other solver and experiment is also documented so the two proposed methods can be understood in context.
+
+---
+
+## 1. Problem being solved
+
+Both files address **sparse linear inverse problems** (compressed sensing / LASSO-type recovery):
+
+```
+y = A x + w,        w ~ N(0, σ² I)
+```
+
+where `x ∈ R^n` is an unknown sparse vector (only `k << n` non-zero entries), `A ∈ R^{m×n}` is a known sensing/measurement matrix (`m < n`, under-determined), and `y ∈ R^m` are the noisy linear observations. The estimator sought is the LASSO solution
+
+```
+x̂ = argmin_x  ½‖y − Ax‖² + λ‖x‖₁
+```
+
+All eight solvers in the registry attempt to approximate this same estimator (or the Bayesian MMSE analogue of it) using different algorithmic strategies, with different convergence speed, robustness, and computational cost trade-offs.
+
+---
+
+## 2. `kamp_complete.py` — Structure Overview
+
+The file is organized into clearly labeled parts:
+
+1. **Part 1 — Shared Data Structures & Utilities** (lines ~94–240): common helper functions used by every solver (soft-thresholding, Lipschitz constant estimation, NMSE/loss tracking, input validation, debiasing, plotting style constants).
+2. **Part 2 — Eight Solvers** (lines ~240–840): `solve_ista`, `solve_fista`, `solve_amp`, `solve_vamp`, `solve_oamp`, `solve_mamp`, the `KAMP` class + `solve_kamp` wrapper, and the `DKAMP` class + `solve_dkamp` wrapper.
+3. **Part 3 — Solver Registry & Matrix Generation** (lines ~842–950): `SOLVER_REGISTRY` dict mapping names to solver functions, `create_measurement_matrix` (builds Gaussian / Bernoulli / correlated / ill-conditioned sensing matrices), and `_make_config` (builds a standard configuration dict for a trial).
+4. **Parts 4 onward — 33 Experiments** (lines ~940–3020): each `experiment_*` function runs Monte-Carlo trials over the solvers, produces PNG figures (via Matplotlib) and CSV tables, and prints console summaries.
+5. **Menu / CLI driver** (lines ~3020–3235): an interactive text menu (`_run_interactive_menu`), a non-interactive `main()` that runs the "core" experiment set, and command-line flags `--demo`, `--test`, `--fast`, `--light`, `--menu`.
+
+### 2.1 Common utilities (Part 1)
+
+| Function | Purpose |
+|---|---|
+| `_is_diverged` | Flags a solution as diverged if its norm blows up (>1e10) or its NMSE exceeds 1e4 or is non-finite. Used by every solver to stop early and mark failure. |
+| `_soft_threshold` / `_kamp_soft_threshold` | The proximal operator of the ℓ1 norm: `sign(u)·max(|u|−α, 0)`. This is the "shrinkage" step common to ISTA/FISTA/AMP-family solvers and the MAP denoiser inside KAMP. |
+| `_smoothed_subdifferential` / `_kamp_soft_derivative` | A smooth (tanh-based) surrogate for the derivative of soft-thresholding, `0.5+0.5·tanh(k(|r|−τ))`, used to build the Jacobian of the denoiser — this is the differentiable substitute for the non-smooth sign function, needed by KAMP's EKF-style linearization. |
+| `_power_method_lipschitz` | Estimates the Lipschitz constant `L = λ_max(AᵀA)` via power iteration; sets the step size for ISTA/FISTA. |
+| `_map_denoiser` | A MAP (maximum-a-posteriori) denoiser used by AMP/VAMP/OAMP: soft-thresholds the pseudo-observation `r` at `λ/γ` and returns the estimate plus the empirical "on-support" fraction `α` (which serves as the Onsager/divergence correction term). |
+| `_track` | Records either the NMSE (if ground truth `true_x` is known) or the LASSO objective value at each iteration — this becomes each solver's convergence `history`. |
+| `_validate_inputs` | Defensive checks: `A` must be 2-D, `y` 1-D, matching row count, and the config dict must supply `max_iter`/`num_iters` and `lam`/`reg_eps`. |
+| `_debias_on_support` | Post-processing step: re-solves an unregularized least-squares problem restricted to the estimated support (entries above a magnitude threshold) to remove the shrinkage bias — used only for diagnostic "debiased NMSE" reporting, not inside the solvers themselves. |
+| `SOLVER_COLORS` / `_MARKERS` / `_LINESTYLES` / `_HATCHES` | A fixed, colorblind-friendly (Paul Tol) plotting palette so every figure across all 33+17 experiments uses the same visual identity per solver. |
+
+### 2.2 The eight solvers (competitive baselines + the two proposed methods)
+
+All solver functions share the same signature `solve_X(A, y, config) -> SolverResult`, where `SolverResult` bundles `x_hat` (final estimate), `history` (per-iteration NMSE or loss), and `info` (iteration count, wall-clock time, divergence flag).
+
+1. **ISTA** (`solve_ista`) — classic proximal gradient descent: `x_{t+1} = soft_threshold(x_t + (1/L)Aᵀ(y−Ax_t), λ/L)`. Slow (sub-linear) convergence, used as the baseline.
+2. **FISTA** (`solve_fista`) — Nesterov-accelerated ISTA using the extrapolation sequence `t_{k+1} = (1+√(1+4t_k²))/2`; converges at `O(1/k²)` instead of ISTA's `O(1/k)`.
+3. **AMP** (`solve_amp`) — Approximate Message Passing with the classical **Onsager correction** term `(n/m)·α·v` added to the residual `v`, which asymptotically decouples the estimation error across coordinates (making it behave like an i.i.d. Gaussian channel per coordinate) for large, i.i.d.-Gaussian sensing matrices. Very fast for well-conditioned Gaussian `A`, but fragile (can diverge) once `A` deviates from that regime.
+4. **VAMP** (`solve_vamp`) — Vector AMP: replaces the scalar Onsager correction with an SVD-based whitening of `A` (`U, s, Vᵀ = svd(A)`), making it robust to right-rotationally-invariant (not just i.i.d.-Gaussian) sensing matrices. Uses damped fixed-point updates for the precision `γ`.
+5. **OAMP** (`solve_oamp`) — Orthogonal AMP: uses an LMMSE (linear-MMSE) module in place of the SVD, alternating between the nonlinear MAP denoiser and a linear estimator `Q_inv (γ_w Aᵀy + γ2 r2)` with `Q = γ_w AᵀA + γ2 I`. Also broadens the class of matrices for which the message-passing state-evolution remains valid.
+6. **MAMP** (`solve_mamp`) — Memory AMP: keeps a weighted history of *all* previous iterates (`x_hist`) combined with Chebyshev-like polynomial coefficients (`b_table`, `w_table`) built from the eigen-spectrum of `AAᵀ`, giving it long-memory orthogonalization instead of only a one-step Onsager term.
+7. **KAMP** — the paper's proposed method (see §3 below).
+8. **DKAMP** — the paper's proposed distributed/consensus extension of KAMP (see §4 below).
+
+### 2.3 `SOLVER_REGISTRY` and matrix/config helpers
+
+```python
+SOLVER_REGISTRY = OrderedDict([
+    ('ISTA', solve_ista), ('FISTA', solve_fista), ('AMP', solve_amp),
+    ('VAMP', solve_vamp), ('OAMP', solve_oamp),
+    ('KAMP', solve_kamp), ('DKAMP', solve_dkamp),
+])
+```
+(Note: `MAMP` is implemented but deliberately excluded from the registry dict used by the default experiment loop — it is called directly where needed, and the regime suite explicitly filters it out: `SOLVERS = [s for s in SOLVER_REGISTRY if s != 'MAMP']`.)
+
+- `create_measurement_matrix(m, n, matrix_type, random_state)` builds the sensing matrix `A`, supporting types such as `'gaussian'` (i.i.d. N(0,1/m)), Bernoulli, correlated/Toeplitz, and ill-conditioned designs — used to stress-test each solver's assumptions.
+- `_make_config(x_true, sigma, lam, max_iter)` builds a standard config dictionary (`lam`, `max_iter`, `tol`, `true_x`, `sigma2`, etc.) reused by every experiment so that all solvers are compared under identical settings.
+
+---
+
+## 3. KAMP — Kalman Approximate Message Passing (the paper's core proposal)
+
+### 3.1 Motivating idea
+
+Standard AMP-family solvers correct for the "extra noise" that the nonlinear denoiser introduces at each iteration using a **deterministic Onsager term** (a scalar or SVD/eigen-based correction) that is only asymptotically exact under strong statistical assumptions on `A` (i.i.d. Gaussian, or right-rotationally invariant). When those assumptions are violated — correlated columns, non-Gaussian/heavy-tailed noise, small problem sizes, dynamic/time-varying signals — this correction becomes wrong and AMP/VAMP/OAMP can diverge or lose accuracy.
+
+**KAMP replaces the deterministic Onsager correction with a full Extended-Kalman-Filter (EKF) style correction.** Instead of tracking only a point estimate, KAMP tracks an estimate **and its uncertainty (covariance)**, and uses a Kalman gain — derived from that uncertainty — to correct the AMP-like prior estimate. This makes the correction adaptive to the actual, empirically observed error statistics rather than relying purely on an asymptotic formula.
+
+### 3.2 Recursion (as documented in the class docstring, lines 452–467)
+
+At every iteration:
+```
+f(x)  = η(x + Aᵀ(y − Ax); λ)         # AMP-like prior/prediction step (soft-thresholding "prior estimate")
+J     = diag(η'(r)) · (I − AᵀA)      # Jacobian of f w.r.t. x  (linearization, EKF-style)
+P⁻    = J P Jᵀ + Q                    # predicted (prior) covariance
+G     = P⁻ Aᵀ (A P⁻ Aᵀ + R)⁻¹        # Kalman gain
+x̂     = x̃ + G (y − A x̃)             # posterior estimate (measurement update)
+P     = (I − GA) P⁻ (I − GA)ᵀ + G R Gᵀ   # Joseph-form covariance update (numerically stable)
+```
+This is exactly the structure of an Extended Kalman Filter where:
+- the "process model" is the AMP soft-thresholding denoiser `η(·)` (nonlinear),
+- `Q` is the process noise covariance (models uncertainty introduced by the nonlinear step / dynamics),
+- `R` is the measurement noise covariance (`σ²_noise · I`),
+- `P` is the posterior error covariance, carried and updated every iteration exactly like a Kalman filter's error covariance.
+
+### 3.3 Step-by-step implementation walk-through (`KAMP` class, lines 452–632)
+
+**Constructor (`__init__`, lines 468–488)** — hyperparameters:
+- `alpha` ∈ [0,1]: damping/learning-rate factor for adaptive process-noise updates.
+- `tau`: base soft-threshold level (paired with `tau_adaptive` for automatic scaling).
+- `max_iter`, `tol`: iteration budget and convergence tolerance.
+- `sigma2_prior`, `sigma2_noise`: optionally user-supplied prior variance and noise variance (auto-estimated from data if omitted).
+- `denoiser` / `subdif_denoiser`: pluggable nonlinearity and its (smoothed) derivative — default to `_kamp_soft_threshold` / `_kamp_soft_derivative`.
+- `project_nonnegative`: optional non-negativity constraint on the solution.
+- `clip_bounds`, `reg_eps`: numerical-stability clipping of `Q` and Tikhonov-style regularization added before Cholesky-inverting the innovation covariance `S`.
+- `tau_adaptive`: if `True`, rescales `tau` at every iteration using a robust noise estimate (see §3.3.2).
+- `iekf_steps`: number of extra **Iterated-EKF** re-linearization passes performed after the main update (improves accuracy when the denoiser is strongly nonlinear near the current estimate).
+- `learn_damping`: if `True`, lets the process-noise covariance `Q` adapt online from the realized correction energy (see §3.3.5), instead of staying fixed.
+
+**`fit(A, y, true_x)` (lines 490–514)** — initializes the filter state before iterating:
+- Auto-estimates `sigma2_prior` from `Var(y) / (m/n)` if not supplied (a rough signal-power estimate consistent with the measurement model).
+- Auto-estimates `sigma2_noise` from the residual energy at `x=0` if not supplied.
+- Initializes `x = 0`, the prior covariance `P = σ²_prior · I_n`, the process-noise covariance `Q = max(noise_floor, 0.1·σ²_prior/m)·I_n`, and the measurement-noise covariance `R = σ²_noise · I_m`.
+- Precomputes `AᵀA` once for reuse.
+
+**`_anneal_tau(r_vec)` (lines 516–523)** — *adaptive thresholding*: estimates a robust noise scale from the pseudo-observation `r` using the **MAD (median absolute deviation) estimator** (`1.4826 · median(|r − median(r)|)`, the standard consistent estimator of σ for Gaussian data), then scales the base `tau` by this estimate and clips it to `[1e-8, 10]`. This lets the shrinkage level self-tune to the current noise level at every iteration rather than using one fixed threshold throughout.
+
+**`_spectral_norm(M)` (lines 525–540)** — a small power-iteration routine (10 steps) to estimate the largest singular value of the Jacobian `J`, used purely for **normalization/stabilization** of the linearized system (see next item).
+
+**`_update_prior_estimation` / `_update_jacobian` (lines 542–551)** — computes the AMP-like prediction `x̃ = η(r; τ_eff)` and its Jacobian `J = diag(η'(r)) · (I − AᵀA)`. If the spectral norm of `J` exceeds 1, `J` is rescaled (`J /= sn`) to keep the linearized dynamics stable (prevents the EKF covariance propagation from blowing up when the denoiser's derivative combined with `AᵀA` is not a contraction).
+
+**`_update_prior_covariance(J)` (line 553-555)** — standard EKF time update: `P⁻ = J P Jᵀ + Q`.
+
+**`_update_kalman_gain(P_)` (lines 557–566)** — computes `G = P⁻Aᵀ S⁻¹` where `S = A P⁻ Aᵀ + R`. Uses a **Cholesky factorization of `S`** (with a small trace-proportional regularizer added for numerical robustness) and two triangular solves instead of an explicit matrix inverse — this is both faster and numerically more stable than direct inversion. If Cholesky fails (S not positive-definite due to numerical issues), it falls back to a Moore-Penrose pseudo-inverse.
+
+**`_update_estimation(x_, G, residual)` (line 568-569)** — the measurement update: `x̂ = x̃ + G·(y − Ax̃)`.
+
+**`_update_covariance(G, P_)` (lines 571–574)** — the **Joseph-form** covariance update `(I−GA)P⁻(I−GA)ᵀ + GRGᵀ`, which (unlike the simpler `(I−GA)P⁻` form) remains symmetric and positive semi-definite even under numerical round-off — the same trick used in high-reliability navigation Kalman filters. The result is also explicitly symmetrized (`0.5(P+Pᵀ)`).
+
+**`_update_process_noise(G, residual, t)` (lines 576–586)** — *optional* (`learn_damping=True`) online adaptation of `Q`: an exponentially-annealed convex combination `Q_{t+1} = α_t Q_t + (1−α_t)(Gr)(Gr)ᵀ` where `α_t = α·exp(−t/max_iter)` decays over iterations (so `Q` adapts quickly early on, then stabilizes), and `Gr = G·residual` is clipped in norm for numerical safety. If `learn_damping=False` (default in the standalone-solver wrapper), `Q` stays fixed at its initial value.
+
+**`solve(true_x)` (lines 596–632)** — the main iteration loop, for `t = 0 … max_iter−1`:
+1. Form the AMP-style pseudo-observation `r = x_prev + Aᵀ(y − A x_prev)`.
+2. Adapt `τ` (if `tau_adaptive`).
+3. Compute the prior estimate `x̃`, Jacobian `J`, predicted covariance `P⁻`, Kalman gain `G`.
+4. Measurement-update `x` and, optionally, repeat `iekf_steps` extra **Iterated-EKF** relinearization/update passes around the *new* `x` (re-linearizing at the updated estimate rather than the old prediction — this is the classical IEKF trick for reducing linearization error).
+5. Optionally project onto the non-negative orthant.
+6. Update the posterior covariance `P` (Joseph form) and, optionally, the process noise `Q`.
+7. Track the relative change `‖x_t − x_{t−1}‖ / ‖x_{t−1}‖` as the convergence criterion, and (if ground truth is available) the running NMSE, with an early-exit if the estimate has diverged.
+8. Stop when `rel_change < tol`, or on divergence/NaN detection.
+
+**`solve_kamp(A, y, config)` (lines 635–660)** — the benchmark-facing wrapper: reads all hyperparameters from the config dict (with sensible defaults: `alpha=0.5`, `tau=0.05`, `tau_adaptive=True`, `iekf_steps=0`, `learn_damping=False`), instantiates and fits a `KAMP` object, runs `.solve()`, and packages the result (using the NMSE history if ground truth is known, otherwise the relative-change convergence history) into the common `SolverResult` structure.
+
+### 3.4 Why this design is expected to help (as implied by the code/experiments)
+
+- The **Kalman gain replaces a single scalar Onsager correction with a full covariance-aware, matrix-valued correction**, so it automatically down-weights the correction when the current estimate is already confident (small `P`) and up-weights it when uncertain — this is more information-theoretically principled than a fixed asymptotic scalar and should degrade more gracefully outside the i.i.d.-Gaussian regime.
+- Carrying an explicit **posterior covariance `P`** is not just an accuracy tool: the experiments in `kamp_regime_suite.py` (Regime IV and V, see §6) use `P` directly for *(i)* validating filter consistency (NEES/NIS), *(ii)* comparing achieved MSE against the Posterior Cramér–Rao Lower Bound (PCRLB), and *(iii)* driving downstream decisions such as active sensing and DKAMP node fusion — capabilities the plain AMP/VAMP/OAMP point estimates cannot support.
+- The **adaptive threshold (`_anneal_tau`)** and optional **Iterated-EKF passes (`iekf_steps`)** are refinements that reduce sensitivity to a fixed threshold hyperparameter and reduce linearization error respectively, at some extra per-iteration cost.
+- Because it is formulated as a Kalman filter, KAMP also naturally supports **sequential/dynamic tracking** (feeding a new `y` at each time step while carrying `x` and `P` forward via `set_state`), which is exploited heavily by the regime-suite experiments (R08, R09, R13, R17) — this is a capability none of the other six baseline solvers have built in.
+
+---
+
+## 4. DKAMP — Distributed Kalman Approximate Message Passing
+
+### 4.1 Motivating idea
+
+DKAMP extends KAMP to a **distributed / multi-node sensing setting**: instead of one node holding all `m` rows of `A` and `y`, the measurements are split across `num_nodes` nodes (each with only a local block `A_i`, `y_i`), connected by a communication graph. Each node runs its own local KAMP filter, then nodes **diffuse** (exchange) their local estimates and covariances with graph-neighbors and fuse them, in a manner directly analogous to *diffusion Kalman filtering / consensus* algorithms in distributed estimation. Because each local KAMP filter already tracks a full covariance `P_i` (not just a point estimate), DKAMP can perform principled **covariance-weighted (inverse-covariance / information-form) fusion** of the multiple local estimates — something a plain point-estimate solver (ISTA/AMP/etc.) could not do.
+
+### 4.2 Recursion, as documented in the class docstring (lines 667–678)
+
+Each round of DKAMP consists of:
+1. **Local update**: every node runs its own local `KAMP.solve()` for a few iterations using only its local block of measurements.
+2. **Diffusion**: each node exchanges `(x̂_i, P_i)` with its graph-neighbors and computes a **covariance-weighted fused estimate** (information filter: sum inverse-covariances, weight each neighbor's mean by its own precision).
+3. The fused state re-initializes the next local KAMP round (via `KAMP.set_state`).
+
+After a fixed number of rounds (or upon consensus-detected convergence), the final globally fused estimate is returned.
+
+### 4.3 Step-by-step implementation walk-through (`DKAMP` class, lines 667–840)
+
+**Constructor** — key parameters: `alpha`, `tau` (passed through to every local KAMP instance), `node_max_iter` (KAMP iterations run *per node per round*), `num_rounds` (max diffusion rounds), `fusion_method='covariance_weighted'`, `min_rounds` and `tol` (early-stop controls).
+
+**`_make_local_kamp(A_k, y_k)`** — instantiates and `.fit()`s one `KAMP` object per node using only that node's local measurement block.
+
+**`_default_graph(num_nodes)`** — if the caller does not supply a communication graph, builds a simple **bidirectional path/chain graph** (`networkx.DiGraph`) connecting node `i` to `i+1` in both directions — a minimal-connectivity topology. (The regime suite's R15/R16/topology experiments substitute other graph topologies such as ring, star, fully-connected, etc.)
+
+**`_cholesky_inv(M, reg)`** — a numerically robust matrix inverse: attempts a regularized Cholesky factorization first (fast, exploits positive-definiteness of covariance matrices), and falls back to an eigen-decomposition with clipped eigenvalues if Cholesky fails (handles near-singular `P` gracefully).
+
+**`_fuse_estimates()`** — the **global read-out fusion** (used to report the overall DKAMP estimate at any point): for every node with a valid (non-NaN) estimate, accumulates the information-form quantities `Σ P_i⁻¹` and `Σ P_i⁻¹ x̂_i`, then solves the linear system for the fused mean — this is the classical **inverse-covariance-weighted (BLUE) combination** of independent Gaussian estimates.
+
+**`_diffuse_node(node_idx)`** — the **local, graph-restricted fusion** step performed every round: each node fuses its own estimate together with only its immediate graph-neighbors' estimates (again via the same information-form combination), producing a new local `(x_fused, P_fused)` pair that becomes that node's *prior* for the next round's local KAMP update. This is the diffusion step that lets information propagate node-to-node across the graph over multiple rounds without any node ever needing global access to all measurements at once.
+
+**`fit(A_list, y_list, graph, true_x)`** — splits the problem across `num_nodes` local KAMP instances (constructing one instance per row-block of `A`), and stores (or defaults) the communication graph.
+
+**`solve()`** — the main round loop:
+1. Compute the initial fused estimate as a baseline.
+2. For each of up to `num_rounds` rounds:
+   a. Every node runs a local KAMP solve pass (`node_estimators[i].solve()`).
+   b. Every node computes its diffused (neighbor-fused) `(x_i, P_i)` via `_diffuse_node`, and all nodes' states are updated **simultaneously** (synchronous diffusion — computed from the *pre-update* estimates of all nodes, then applied together, avoiding order-dependent bias).
+   c. The global fused estimate is recomputed and (if ground truth is available) its NMSE is recorded; divergence triggers early stop.
+   d. A **relative-change convergence check** is performed using a 3-round moving average of the fused-estimate's relative change (`_delta_buffer`); once this moving average is below `dkamp_tol` for 3 consecutive checks (and at least `min_rounds` rounds have executed), the round loop stops early.
+3. Returns the final global fused estimate.
+
+**`communication_cost()`** — a bookkeeping utility that reports the number of messages exchanged per round (`2 × #edges`, since communication is bidirectional), the size of each message (`n + n²` floats — a mean vector plus a full covariance matrix), and the resulting total communication volume over all executed rounds. This quantifies the price paid for DKAMP's distributed operation and is used directly in the scalability/complexity experiments.
+
+**`solve_dkamp(A, y, config)` (lines 812–839)** — the benchmark-facing wrapper: splits a single centralized `(A, y)` problem into `num_nodes` equal row-blocks (simulating a distributed sensing scenario from otherwise centralized data), builds and runs a `DKAMP` instance, and returns a `SolverResult` whose `history` is the round-by-round NMSE (or relative-change) of the fused estimate.
+
+### 4.4 Why this design is useful (as implied by the code/experiments)
+
+- DKAMP is the only solver in the registry that operates without any single node ever holding the complete measurement set — appropriate for sensor networks, federated/multi-agent sensing, or privacy/bandwidth-constrained settings.
+- Because fusion is **covariance-weighted** rather than a simple average, nodes with more informative (lower-uncertainty) local estimates are automatically trusted more — a direct benefit of KAMP's covariance tracking being available at every node.
+- The consensus/diffusion structure is robust to **node failure** and **topology changes** (explored in the regime-suite's R15/R16 experiments — see §6), since information can still reach a node indirectly through its remaining neighbors.
+
+---
+
+## 5. Experiment Suite in `kamp_complete.py` (Sections A–F, 33 analyses)
+
+The `_CORE_EXPERIMENTS` list (built inside `_load_showcase`/menu code, referencing functions defined throughout the file) groups experiments into six lettered sections, matching the file's own header summary:
+
+**Section A — Algorithm Validation**
+- **Onsager Correction Validation** (`experiment_onsager_validation`): directly compares AMP's deterministic Onsager term against KAMP's Kalman-gain correction, quantifying the "correction gap" between the two philosophies.
+- **State Evolution** (`experiment_state_evolution`): compares the theoretical state-evolution (SE) prediction of AMP-family NMSE against the empirically observed NMSE, checking how well the classical AMP theory tracks reality — and by extension, how KAMP's behavior compares to that theoretical prediction.
+
+**Section B — Core Benchmarking**
+- **Full Solver Benchmark** (`experiment_full_benchmark`, and its SNR-sweep and heatmap variants): runs all 7 registered solvers across 4 sensing-matrix types and 2 signal models, reporting NMSE, runtime, and iteration counts.
+- **Covariance Modes** (`experiment_covariance_modes`, `experiment_covariance_structure_modes`): sweeps different covariance-parameterization choices ("KAMP-full" vs. simplified diagonal/scalar covariance) against AMP/VAMP/OAMP, isolating how much of KAMP's advantage comes from tracking a *full* covariance matrix versus a cheaper approximation.
+- **Phase Transition** (`experiment_phase_transition`): produces Donoho–Tanner style `δ`–`ρ` (measurement-ratio vs. sparsity-ratio) phase diagrams showing the region of exact/near-exact recovery for each solver.
+
+**Section C — Robustness & Complexity**
+- **Noise Mismatch Stress Test** (`experiment_noise_mismatch`): perturbs the assumed noise level by 0.1×–10× the true value to test each solver's sensitivity to a mis-specified noise model.
+- **Scalability Analysis** (`experiment_scalability`, `experiment_large_scale`): measures wall-clock runtime as `n` (signal dimension) grows.
+- **Complexity Analysis** (`experiment_complexity_analysis`): reports theoretical/measured per-iteration and total computational cost (relevant because KAMP's per-iteration cost is higher — it involves an `m×m` Cholesky factorization — while DKAMP additionally incurs communication cost).
+- **Convergence Speed** (`experiment_convergence_speed`): measures the number of iterations each solver needs to reach a target NMSE.
+
+**Section D — Ablation & Statistics**
+- **Hyperparameter Ablation** (`experiment_ablation`): sweeps KAMP's own hyperparameters — damping `alpha`, threshold `tau`/`k`, gain clipping bounds, and the regularization epsilon `reg_eps` — to show sensitivity/robustness to each.
+- **Statistical Comparison** (`experiment_statistical_comparison`): runs many trials and applies **Mann–Whitney U tests with Holm–Bonferroni correction** to determine whether NMSE differences between solvers are statistically significant (not just apparent in the mean).
+- **Continuous Sweep** (`experiment_continuous_sweep`): sweeps `κ` (condition-number-like) and `ρ` (sparsity ratio) parameters continuously across all solvers for a fine-grained robustness map.
+
+**Section E — Distributed Extension**
+- **DKAMP Topology Study** (`experiment_distributed_scenario`, and related): compares 5 different communication-graph topologies (e.g., chain, ring, star, fully-connected, random) for DKAMP's diffusion consensus, measuring how topology affects convergence speed and final NMSE.
+
+Additional experiments present in the file cover extended stress conditions: dynamic/time-varying tracking (`experiment_time_varying_tracking`), abrupt support changes, colored/AR(1)/non-Gaussian noise (`experiment_colored_noise`, `experiment_ar1_stress`, `experiment_non_gaussian_noise`), ill-conditioned matrices (`experiment_ill_conditioned_extended`), initialization sensitivity (`experiment_init_sensitivity`), and a general statistical summary (`experiment_statistical_summary`) — all producing dedicated PNG figures in `experiments/figures/` and CSV tables in `experiments/data/`.
+
+A separate, optional module `kamp_showcase_experiments.py` (loaded dynamically via `_load_showcase()`, not included in the uploaded files) can add ten more "showcase" experiments (S1–S10: dynamic tracking, abrupt support change, DKAMP topology comparison, node-failure robustness, low measurement-rate and low-SNR stress tests) to the interactive menu, if present.
+
+### CLI usage (`kamp_complete.py`)
+```
+python kamp_complete.py                 # interactive menu (default)
+python kamp_complete.py --test          # quick 2-second solver sanity check
+python kamp_complete.py --menu / -m     # interactive menu explicitly
+python kamp_complete.py --fast          # reduced iteration/round counts, all core experiments
+python kamp_complete.py --light         # lighter-weight run
+```
+Inside the interactive menu, the user can run individual experiments by code (e.g. `A1`), ranges (`1-5,7-9`), whole sections (`A`,`B`,…), `all`, `core`, `showcase`, or a `test` quick-check.
+
+---
+
+## 6. `kamp_regime_suite.py` — the 17-Experiment "Regime" Suite
+
+This file is a **second, self-contained experiment driver** that imports the solvers and utilities directly from `kamp_complete.py` (`from kamp_complete import SOLVER_REGISTRY, _make_config, create_measurement_matrix, _is_diverged, KAMP, DKAMP, _solver_style, _debias_on_support, SOLVER_COLORS, ...`). It does **not** redefine the solvers — it only adds new experimental scenarios and figures, organized into six scientific "regimes" that build an escalating case for KAMP/DKAMP: first matching the classical baselines under ideal conditions, then showing where the baselines' assumptions break, then showing capabilities the baselines simply lack, then rigorously validating KAMP as a statistically consistent filter, then exploiting its covariance output for real decisions, and finally validating it on a realistic external application.
+
+Its own helper functions (`_nmse`, `_sem`, `_holm_correct`, `_toep_corr`/`_ar1_matrix` for AR(1)-correlated sensing matrices, `_overlap_basis` for controllable inter-node basis overlap, `_make_signal`, `_noise_sigma`, plus plotting helpers `_line_style`, `_bar_style`, `_band` for 95% CI shading, and `_panel_label` for (a)(b)(c) sub-figure labels) exist purely to standardize the regime-suite's own Q1-journal-grade figure style (400 dpi, Times New Roman, Paul Tol palette, white-filled/black-edged markers, SEM error bars) — separate output directories `experiments/regime_figures/` and `experiments/regime_data/` are used so this suite never overwrites the outputs of `kamp_complete.py`.
+
+### Regime I — Standard i.i.d. Compressed Sensing (Honest Control), R01–R03
+Establishes a fair baseline where the classical AMP-family assumptions genuinely hold (i.i.d. Gaussian `A`), so that later regimes' differences can be attributed to assumption violations rather than KAMP simply "winning everywhere."
+- **R01** — Static benchmark: NMSE sweeps over SNR, sparsity ratio `ρ`, and measurement ratio `δ`, across all solvers.
+- **R02** — Phase transition: Donoho–Tanner recovery-boundary diagram.
+- **R03** — Statistical comparison: many trials + Mann–Whitney U test with Holm correction, to certify that any observed NMSE gap is statistically significant, not noise.
+
+### Regime II — Structural Violations of AMP/VAMP/OAMP Assumptions, R04–R07
+Deliberately breaks the statistical assumptions that AMP/VAMP/OAMP rely on, to probe robustness.
+- **R04** — Correlated measurement matrices: sensing matrices with AR(1)/Toeplitz-correlated columns (`_ar1_matrix`), violating the i.i.d.-Gaussian assumption underlying classical AMP.
+- **R05** — Heteroscedastic noise: per-measurement noise variance that is not constant, violating the i.i.d. noise assumption.
+- **R06** — Heavy-tailed noise: non-Gaussian, outlier-prone noise distributions.
+- **R07** — Colored (correlated) noise across measurements.
+
+### Regime III — Capabilities Competitors Cannot Match, R08–R11
+Demonstrates scenarios that intrinsically require KAMP's Kalman/sequential structure, which the other (static, single-shot) solvers have no mechanism to address at all.
+- **R08** — Dynamic tracking: a time-varying sparse signal is tracked sequentially, and KAMP's process-noise (`R`/`Q`) tuning is explicitly exploited (via the `_kamp_track` helper, which runs KAMP recursively across time steps carrying `x` and `P` forward, versus re-solving from scratch each step with a static solver like FISTA).
+- **R09** — Change-point detection: abrupt changes in the signal's support, testing how quickly KAMP's covariance-driven correction re-adapts.
+- **R10** — Graph-structured priors: incorporating structured (graph) sparsity priors that a plain scalar-Onsager AMP cannot represent.
+- **R11** — 1-bit quantized measurements: a nonlinear, non-Gaussian observation model outside the standard linear-Gaussian AMP framework.
+
+### Regime IV — Rigorous Theoretical Validation, R12–R13
+Validates that KAMP is not just empirically good but *statistically well-behaved* as an estimator/filter.
+- **R12 — PCRLB validation** (`experiment_r12_pcrlb`): compares KAMP's, VAMP's, and FISTA's achieved per-coordinate MSE against the **Posterior Cramér–Rao Lower Bound** for the known-support oracle estimator (`σ²·trace((AₛᵀAₛ)⁻¹)/n`), across SNR levels — checking how close each solver's error gets to the fundamental estimation-theoretic floor.
+- **R13 — NEES/NIS consistency** (`experiment_r13_nees_nis`): computes the **Normalized Estimation Error Squared (NEES)** and **Normalized Innovation Squared (NIS)** — the standard Kalman-filter consistency diagnostics — as a function of the tuned process-noise level `Q`, verifying that KAMP's reported covariance `P` is *statistically consistent* with its actual errors (a properly tuned/consistent filter should have `E[NEES] = E[NIS] = 1`). The experiment identifies an "operating point" `Q*` where this consistency condition holds, directly validating that KAMP's covariance output can be trusted as a genuine uncertainty quantification, not just an internal bookkeeping variable.
+
+### Regime V — Actionable Applications of the Posterior Covariance, R14–R16
+Shows concrete uses that are only possible because KAMP/DKAMP output a full covariance, not just a point estimate.
+- **R14 — Active sensing** (`experiment_r14_active_sensing`): uses KAMP's posterior-information matrix to **greedily select which measurement rows to acquire** (maximizing a P1FIM-style information criterion, `argmax_i sum((P⁻¹Aᵀ)[:,i]²)`), and shows this outperforms random row selection — a direct downstream application of covariance-aware estimation.
+- **R15 — DKAMP scheduling**: studies how the number/frequency of diffusion rounds ("triggers") trades off NMSE against communication/runtime cost in the distributed setting.
+- **R16 — DKAMP node-failure robustness**: tests DKAMP's resilience when nodes fail or when two nodes' local sensing bases become increasingly independent/non-overlapping (via `_overlap_basis`), showing graceful degradation rather than catastrophic failure.
+
+### Regime VI — Application-Driven External Validation, R17
+- **R17 — Jakes doubly-selective fading channel** (`experiment_r17_jakes_channel`): a realistic wireless-communications application — a time-varying sparse channel whose taps fade according to the classical **Jakes Doppler spectrum** (envelope autocorrelation `a = 1 − 2(π·f_d·T_s)²`, an AR(1) approximation of the Jakes model), tracked recursively with KAMP versus re-estimated independently per symbol with FISTA. This demonstrates KAMP's Kalman recursion providing a concrete, domain-relevant advantage (Doppler-tracking channel estimation) over a competitive but memoryless baseline.
+
+### CLI usage (`kamp_regime_suite.py`)
+```
+python kamp_regime_suite.py --list             # list all 17 experiments and exit
+python kamp_regime_suite.py --fast             # quick verification with reduced problem sizes/trials
+python kamp_regime_suite.py --only R01,R08     # run only the selected experiment IDs
+python kamp_regime_suite.py                    # run all 17 at full settings
+```
+All outputs are written to `experiments/regime_figures/*.png` (400 dpi) and `experiments/regime_data/*.csv`, with console `[PASS]`/`[FAIL]` status per experiment and a running elapsed-time counter.
+
+---
+
+## 7. Summary of the Two Files' Relationship
+
+| | `kamp_complete.py` | `kamp_regime_suite.py` |
+|---|---|---|
+| Role | Defines all 8 solvers (incl. KAMP/DKAMP classes) + runs 33 general benchmarking/ablation/robustness experiments | Imports the solvers as a library; runs 17 additional, narrative-structured experiments organized into 6 "regimes" that build a complete evidence case for KAMP/DKAMP |
+| Output dirs | `experiments/data/`, `experiments/figures/` | `experiments/regime_data/`, `experiments/regime_figures/` |
+| Core contribution documented | The KAMP EKF/Kalman-gain recursion and the DKAMP diffusion-consensus recursion (this document, §3–§4) | Statistical validation (PCRLB, NEES/NIS) and applied demonstrations (active sensing, distributed scheduling/robustness, Doppler channel tracking) of the same two methods |
+| Solvers used | All 7 registered solvers (ISTA, FISTA, AMP, VAMP, OAMP, KAMP, DKAMP); MAMP implemented but excluded from the default registry loop | Same 7, with MAMP explicitly filtered out (`SOLVERS = [s for s in SOLVER_REGISTRY if s != 'MAMP']`) |
+
+In short: **`kamp_complete.py` is the algorithmic engine (where KAMP and DKAMP are actually implemented), and `kamp_regime_suite.py` is the empirical/statistical argument built on top of that engine**, designed to substantiate the paper's claims about KAMP/DKAMP with a structured, six-regime body of evidence — from a fair baseline comparison, through assumption-violation stress tests and uniquely-KAMP capabilities, to rigorous filter-consistency proofs and finally a concrete wireless-channel application.
